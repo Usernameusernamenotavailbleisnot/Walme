@@ -573,7 +573,7 @@ async function runBot() {
             }
 
             // Shorter interval for testing - adjust as needed
-            const runInterval = 3; // hours
+            const runInterval = 25; // hours
             const nextRunTime = startCountdown(runInterval);
             await new Promise(resolve => setTimeout(resolve, nextRunTime - new Date()));
             console.log('');
