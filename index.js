@@ -4,16 +4,33 @@ const SocksProxyAgent = require('socks-proxy-agent').SocksProxyAgent;
 const HttpProxyAgent = require('http-proxy-agent').HttpProxyAgent;
 const HttpsProxyAgent = require('https-proxy-agent').HttpsProxyAgent;
 
+// Initialize chalk properly
 let chalk;
 (async () => {
     chalk = (await import('chalk')).default;
-    runBot();
+    // Only start the bot after chalk is loaded
+    await startBot();
 })();
 
+// Constants and Configuration
 const BASE_URL = 'https://api.walme.io/waitlist/tasks';
 const PROFILE_URL = 'https://api.walme.io/user/profile';
-const COMPLETED_TASKS_FILE = 'completed_tasks.json';
 const PROXIES_FILE = 'proxies.txt';
+
+// Configuration constants
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 3000; // 3 seconds
+const REQUEST_TIMEOUT = 15000; // 15 seconds
+
+// Constants for special tasks
+const DAILY_CHALLENGE_TASK_ID = 17280603; // ID of the 7-DAY Challenge task
+
+// List of common proxy error codes
+const PROXY_ERROR_CODES = [
+    'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EHOSTUNREACH',
+    'ENOTFOUND', 'ESOCKETTIMEDOUT', 'EPROTO', 'ECONNABORTED',
+    'EADDRNOTAVAIL', 'ENETUNREACH'
+];
 
 async function getAccessTokens() {
     try {
@@ -118,54 +135,156 @@ function createProxyAgent(proxyString) {
     }
 }
 
-async function getUserProfile(token, proxyAgent) {
-    try {
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Accept': 'application/json'
-            }
-        };
-        
-        if (proxyAgent) {
-            if (proxyAgent.http && proxyAgent.https) {
-                config.httpAgent = proxyAgent.http;
-                config.httpsAgent = proxyAgent.https;
+// Function to check if an error is a proxy-related error
+function isProxyError(error) {
+    if (!error) return false;
+    
+    // Check for axios error with code
+    if (error.code && PROXY_ERROR_CODES.includes(error.code)) {
+        return true;
+    }
+    
+    // Check for network errors in axios
+    if (error.message && (
+        error.message.includes('socket hang up') ||
+        error.message.includes('Client network socket disconnected') ||
+        error.message.includes('read ECONNRESET') ||
+        error.message.includes('connect ETIMEDOUT') ||
+        error.message.includes('connect ECONNREFUSED') ||
+        error.message.includes('getaddrinfo ENOTFOUND') ||
+        error.message.includes('ECONN') ||
+        error.message.includes('ETIMEOUT') ||
+        error.message.includes('EPROTO') ||
+        error.message.includes('ECONNABORTED') ||
+        error.message.includes('ERR_PROXY')
+    )) {
+        return true;
+    }
+    
+    // Check for HTTP status codes that might indicate proxy issues
+    if (error.response && (error.response.status === 407 || error.response.status === 502 || 
+                          error.response.status === 503 || error.response.status === 504)) {
+        return true;
+    }
+    
+    return false;
+}
+
+// Create axios config with proxy and timeout
+function createRequestConfig(token, proxyAgent) {
+    const config = {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json',
+            'Content-Type': 'application/json'
+        },
+        timeout: REQUEST_TIMEOUT
+    };
+    
+    if (proxyAgent) {
+        if (proxyAgent.http && proxyAgent.https) {
+            config.httpAgent = proxyAgent.http;
+            config.httpsAgent = proxyAgent.https;
+        } else {
+            config.httpsAgent = proxyAgent;
+            config.httpAgent = proxyAgent;
+        }
+    }
+    
+    return config;
+}
+
+// Retry function for API requests using the same proxy
+async function retryApiRequest(requestFn, args, proxyString, maxRetries = MAX_RETRIES) {
+    let proxyAgent = null;
+    if (proxyString) {
+        proxyAgent = createProxyAgent(proxyString);
+        if (!proxyAgent) {
+            console.log(chalk.yellow(`[WARNING] Failed to create proxy agent for: ${proxyString}. Continuing without proxy.`));
+        } else {
+            console.log(chalk.white(`🌐 [INFO] Using proxy: ${proxyString.replace(/:[^:]*@/, ':****@')}`));
+        }
+    }
+    
+    // Extract token from args
+    const token = args[0];
+    
+    // Calculate progressive backoff delays for retries
+    const getBackoffDelay = (attempt) => {
+        // Exponential backoff: starts with RETRY_DELAY and increases
+        return RETRY_DELAY * Math.pow(1.5, attempt - 1);
+    };
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            // Call the request function with appropriate arguments
+            return await requestFn(...args, proxyAgent);
+        } catch (error) {
+            const isProxy = isProxyError(error);
+            const errorCode = error.code || 'unknown';
+            const errorMessage = error.message || 'No error message';
+            const httpStatus = error.response?.status ? `HTTP ${error.response.status}` : '';
+            const errorDetails = httpStatus ? `${errorCode} (${httpStatus})` : errorCode;
+            
+            if (attempt < maxRetries) {
+                // Calculate delay for this retry with backoff
+                const retryDelay = getBackoffDelay(attempt);
+                
+                if (isProxy) {
+                    console.error(chalk.yellow(`🔄 [RETRY] Proxy error (${errorDetails}): ${errorMessage}`));
+                    console.log(chalk.yellow(`🔄 [RETRY] Attempt ${attempt}/${maxRetries} - Retrying in ${retryDelay/1000} seconds...`));
+                } else {
+                    console.error(chalk.red(`❌ [ERROR] Request failed: ${errorMessage}`));
+                    console.log(chalk.yellow(`🔄 [RETRY] Attempt ${attempt}/${maxRetries} - Retrying in ${retryDelay/1000} seconds...`));
+                }
+                
+                // Wait before retry
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+                
+                // For proxy errors, recreate the proxy agent (helps with some connection issues)
+                if (isProxy && proxyString) {
+                    proxyAgent = createProxyAgent(proxyString);
+                    console.log(chalk.white(`🌐 [INFO] Recreated proxy agent for retry`));
+                }
             } else {
-                config.httpsAgent = proxyAgent;
-                config.httpAgent = proxyAgent;
+                // Last attempt failed
+                if (isProxy) {
+                    console.error(chalk.red.bold(`💥 [ERROR] All ${maxRetries} proxy retry attempts failed: ${errorMessage}`));
+                } else {
+                    console.error(chalk.red.bold(`💥 [ERROR] All ${maxRetries} retry attempts failed: ${errorMessage}`));
+                }
+                throw error;
             }
         }
-        
+    }
+}
+
+async function getUserProfile(token, proxyAgent) {
+    try {
+        const config = createRequestConfig(token, proxyAgent);
         const response = await axios.get(PROFILE_URL, config);
-        const { email, nickname } = response.data;
-        console.log(chalk.white(`✨ [INFO] Profile fetched - Email: ${email}, Nickname: ${nickname}`));
-        return { email, nickname };
+        
+        // Extract data from response safely with defaults
+        const email = response.data?.email || null;
+        const nickname = response.data?.nickname || 'unknown_user';
+        // Use nickname as userId if email is not available
+        const userId = email || nickname || `user_${Date.now()}`; 
+        
+        console.log(chalk.white(`✨ [INFO] Profile fetched - Email: ${email || 'not available'}, Nickname: ${nickname}`));
+        return { 
+            email, 
+            nickname, 
+            userId 
+        };
     } catch (error) {
         console.error(chalk.red.bold(`[ERROR] Failed to fetch user profile: ${error.response?.data?.message || error.message}`));
-        throw error;
+        throw new Error(`Profile fetch failed: ${error.message}`);
     }
 }
 
 async function getTasks(token, proxyAgent) {
     try {
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Accept': 'application/json'
-            }
-        };
-        
-        if (proxyAgent) {
-            if (proxyAgent.http && proxyAgent.https) {
-                config.httpAgent = proxyAgent.http;
-                config.httpsAgent = proxyAgent.https;
-            } else {
-                config.httpsAgent = proxyAgent;
-                config.httpAgent = proxyAgent;
-            }
-        }
-        
+        const config = createRequestConfig(token, proxyAgent);
         const response = await axios.get(BASE_URL, config);
         return response.data;
     } catch (error) {
@@ -174,26 +293,10 @@ async function getTasks(token, proxyAgent) {
     }
 }
 
+// Modified task processing to fix the null error
 async function completeTask(taskId, token, proxyAgent) {
     try {
-        const config = {
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Accept': 'application/json',
-                'Content-Type': 'application/json'
-            }
-        };
-        
-        if (proxyAgent) {
-            if (proxyAgent.http && proxyAgent.https) {
-                config.httpAgent = proxyAgent.http;
-                config.httpsAgent = proxyAgent.https;
-            } else {
-                config.httpsAgent = proxyAgent;
-                config.httpAgent = proxyAgent;
-            }
-        }
-        
+        const config = createRequestConfig(token, proxyAgent);
         const response = await axios.patch(`${BASE_URL}/${taskId}`, {}, config);
         console.log(chalk.green(`✅ [SUCCESS] Task ${taskId} processed: ${response.data.title}`));
         return response.data;
@@ -203,44 +306,12 @@ async function completeTask(taskId, token, proxyAgent) {
     }
 }
 
-async function loadCompletedTasks() {
-    try {
-        const data = await fs.readFile(COMPLETED_TASKS_FILE, 'utf8');
-        return JSON.parse(data);
-    } catch (error) {
-        return {};
-    }
-}
-
-async function saveCompletedTasks(completedTasks) {
-    try {
-        await fs.writeFile(COMPLETED_TASKS_FILE, JSON.stringify(completedTasks, null, 2));
-    } catch (error) {
-        console.error(chalk.red.bold(`[ERROR] Failed to save completed tasks: ${error.message}`));
-    }
-}
-
-async function dailyCheckIn(day, completedTasks, profile) {
-    const today = new Date().toISOString().split('T')[0];
-    if (!completedTasks[profile.email]) completedTasks[profile.email] = { checkInDays: {} };
-    
-    if (!completedTasks[profile.email].checkInDays[today]) {
-        console.log(chalk.yellow(`🌟 [INFO] ${profile.email} - Day ${day} - 7-Day Challenge: Boost Your XP - Check-in successful!`));
-        completedTasks[profile.email].checkInDays[today] = true;
-
-        if (Object.keys(completedTasks[profile.email].checkInDays).length === 7) {
-            console.log(chalk.green.bold(`🎉 [SUCCESS] ${profile.email} - 7-Day Challenge completed! XP Boost earned!`));
-        }
-    } else {
-        console.log(chalk.yellow(`⏳ [INFO] ${profile.email} - Already checked in today (${today})`));
-    }
-    return completedTasks;
-}
-
-function startCountdown() {
+function startCountdown(duration = 24) {
     const nextRun = new Date();
-    nextRun.setHours(nextRun.getHours() + 24);
-    const totalMs = 24 * 60 * 60 * 1000;
+    nextRun.setHours(nextRun.getHours() + duration);
+    const totalMs = duration * 60 * 60 * 1000;
+
+    console.log(chalk.blue.bold(`🕒 [INFO] Next run scheduled in ${duration} hour(s) at ${nextRun.toLocaleTimeString()}`));
 
     const interval = setInterval(() => {
         const now = new Date();
@@ -266,56 +337,162 @@ function startCountdown() {
     return nextRun;
 }
 
-async function processAccount(token, completedTasks, proxyAgent) {
+// Function to handle the daily challenge task specifically
+async function processDailyChallenge(token, tasks, proxyAgent) {
     try {
-        console.log(chalk.white('👤 [INFO] Fetching user profile...'));
-        const profile = await getUserProfile(token, proxyAgent);
-
-        const dayCount = completedTasks[profile.email]?.checkInDays 
-            ? Object.keys(completedTasks[profile.email].checkInDays).length + 1 
-            : 1;
+        // Find the daily challenge task
+        const dailyTask = tasks.find(task => task.id === DAILY_CHALLENGE_TASK_ID);
+        
+        if (!dailyTask) {
+            console.log(chalk.yellow(`⚠️ [INFO] Daily challenge task not found`));
+            return false;
+        }
+        
+        // Check if the task is already completed for today (status will be completed or started)
+        if (dailyTask.status === 'completed' || dailyTask.status === 'started') {
+            const dayInfo = dailyTask.iterator?.day || 'unknown';
+            console.log(chalk.yellow(`⏳ [INFO] Daily challenge already active (Day ${dayInfo})`));
+            return true;
+        }
+        
+        // Process the daily challenge
+        console.log(chalk.yellow(`🌟 [INFO] Processing daily challenge...`));
+        
+        const config = createRequestConfig(token, proxyAgent);
+        const response = await axios.patch(`${BASE_URL}/${DAILY_CHALLENGE_TASK_ID}`, {}, config);
+        
+        if (response.data && response.data.iterator) {
+            const { day, reward } = response.data.iterator;
+            console.log(chalk.green(`✅ [SUCCESS] Daily challenge Day ${day} completed! Earned ${reward} XP`));
             
-        if (dayCount <= 7) {
-            completedTasks = await dailyCheckIn(dayCount, completedTasks, profile);
+            if (day === 7) {
+                console.log(chalk.green.bold(`🎉 [SUCCESS] 7-Day Challenge completed! Full XP Boost earned!`));
+            }
         } else {
-            console.log(chalk.cyan(`🏆 [INFO] ${profile.email} - 7-Day Challenge already completed!`));
+            console.log(chalk.green(`✅ [SUCCESS] Daily challenge completed!`));
+        }
+        
+        return true;
+    } catch (error) {
+        console.error(chalk.red(`❌ [ERROR] Failed to process daily challenge: ${error.message}`));
+        return false;
+    }
+}
+
+async function processAccount(token, proxyString) {
+    let profile = null;
+    let proxyAgent = null;
+    
+    try {
+        // Create proxy agent if proxy string provided
+        if (proxyString) {
+            proxyAgent = createProxyAgent(proxyString);
+        }
+        
+        // Get user profile
+        console.log(chalk.white('👤 [INFO] Fetching user profile...'));
+        try {
+            profile = await retryApiRequest(getUserProfile, [token], proxyString);
+        } catch (profileError) {
+            console.error(chalk.red.bold(`[ERROR] Failed to fetch profile: ${profileError.message}`));
+            return; // Exit early if profile fetch fails
+        }
+        
+        // Make sure we have a nickname for display
+        const nickname = profile?.nickname || 'unknown_user';
+        
+        // Fetch task list
+        console.log(chalk.white(`📋 [INFO] ${nickname} - Fetching task list...`));
+        let tasks = [];
+        try {
+            tasks = await retryApiRequest(getTasks, [token], proxyString);
+            console.log(chalk.white(`📋 [INFO] ${nickname} - Task list fetched, total tasks: ${tasks.length}`));
+        } catch (tasksError) {
+            console.error(chalk.red.bold(`[ERROR] ${nickname} - Failed to fetch tasks: ${tasksError.message}`));
+            return; // Exit early if task fetch fails
         }
 
-        console.log(chalk.white(`📋 [INFO] ${profile.email} - Fetching task list...`));
-        const tasks = await getTasks(token, proxyAgent);
-        console.log(chalk.white(`📋 [INFO] ${profile.email} - Task list fetched, total tasks: ${tasks.length}`));
+        // First, handle the daily challenge task
+        let dailyChallengeSuccess = false;
+        try {
+            dailyChallengeSuccess = await processDailyChallenge(token, tasks, proxyAgent);
+        } catch (dcError) {
+            console.error(chalk.red(`❌ [ERROR] ${nickname} - Error in daily challenge: ${dcError.message}`));
+        }
 
+        // Filter tasks to only process those that need to be completed
+        // Skip the daily challenge task as we've already handled it
         const pendingTasks = tasks.filter(task => 
-            task.status === 'new' && (!completedTasks[profile.email]?.tasks || !completedTasks[profile.email].tasks[task.id])
+            (task.status === 'new' || task.status === 'failed') && 
+            task.id !== DAILY_CHALLENGE_TASK_ID
         );
-        console.log(chalk.white(`📋 [INFO] ${profile.email} - New pending tasks: ${pendingTasks.length}`));
+        console.log(chalk.white(`📋 [INFO] ${nickname} - Pending tasks: ${pendingTasks.length}`));
+
+        // Initialize task counter
+        let completedTaskCount = 0;
+        let failedTaskCount = 0;
 
         for (const task of pendingTasks) {
-            console.log(chalk.yellow(`🔧 [INFO] ${profile.email} - Processing task: ${task.title} (ID: ${task.id})`));
+            console.log(chalk.yellow(`🔧 [INFO] ${nickname} - Processing task: ${task.title} (ID: ${task.id})`));
 
-            if (task.child && task.child.length > 0) {
-                for (const childTask of task.child) {
-                    if (childTask.status === 'new' && (!completedTasks[profile.email]?.tasks || !completedTasks[profile.email].tasks[childTask.id])) {
-                        await completeTask(childTask.id, token, proxyAgent);
-                        if (!completedTasks[profile.email].tasks) completedTasks[profile.email].tasks = {};
-                        completedTasks[profile.email].tasks[childTask.id] = true;
-                        await new Promise(resolve => setTimeout(resolve, 1000));
+            try {
+                if (task.child && task.child.length > 0) {
+                    for (const childTask of task.child) {
+                        if (childTask.status === 'new' || childTask.status === 'failed') {
+                            try {
+                                // Create config for this request
+                                const config = createRequestConfig(token, proxyAgent);
+                                
+                                // Complete the task directly
+                                await axios.patch(`${BASE_URL}/${childTask.id}`, {}, config);
+                                
+                                completedTaskCount++;
+                                console.log(chalk.green(`✅ [SUCCESS] ${nickname} - Completed child task: ${childTask.title} (ID: ${childTask.id})`));
+                                
+                                // Add random delay between 1-3 seconds
+                                const delay = 1000 + Math.random() * 2000;
+                                await new Promise(resolve => setTimeout(resolve, delay));
+                            } catch (childTaskError) {
+                                failedTaskCount++;
+                                console.error(chalk.red(`❌ [ERROR] ${nickname} - Failed to complete child task ${childTask.id}: ${childTaskError.message}`));
+                            }
+                        }
                     }
+                } else {
+                    // Create config for this request
+                    const config = createRequestConfig(token, proxyAgent);
+                    
+                    // Complete the task directly
+                    await axios.patch(`${BASE_URL}/${task.id}`, {}, config);
+                    
+                    completedTaskCount++;
+                    console.log(chalk.green(`✅ [SUCCESS] ${nickname} - Completed task: ${task.title} (ID: ${task.id})`));
+                    
+                    // Add random delay between 1-3 seconds
+                    const delay = 1000 + Math.random() * 2000;
+                    await new Promise(resolve => setTimeout(resolve, delay));
                 }
-            } else {
-                await completeTask(task.id, token, proxyAgent);
-                if (!completedTasks[profile.email].tasks) completedTasks[profile.email].tasks = {};
-                completedTasks[profile.email].tasks[task.id] = true;
-                await new Promise(resolve => setTimeout(resolve, 1000));
+            } catch (taskError) {
+                failedTaskCount++;
+                console.error(chalk.red(`❌ [ERROR] ${nickname} - Failed to complete task ${task.id}: ${taskError.message}`));
             }
         }
 
-        console.log(chalk.green.bold(`🎉 [SUCCESS] ${profile.email} - All new tasks have been processed`));
-        return completedTasks;
-
+        console.log(chalk.green.bold(`🎉 [SUCCESS] ${nickname} - Processed ${completedTaskCount} tasks successfully, ${failedTaskCount} tasks failed`));
+        
+        // Daily challenge status
+        if (dailyChallengeSuccess) {
+            console.log(chalk.blue(`ℹ️ [INFO] ${nickname} - Daily challenge processed successfully`));
+        }
+        
     } catch (error) {
-        console.error(chalk.red.bold(`💥 [ERROR] Account processing failed: ${error.message}`));
-        return completedTasks;
+        const displayName = profile?.nickname || 'unknown account';
+        
+        if (isProxyError(error)) {
+            console.error(chalk.red.bold(`💥 [ERROR] ${displayName} - Proxy error: ${error.code || error.message}`));
+        } else {
+            console.error(chalk.red.bold(`💥 [ERROR] ${displayName} - Account processing failed: ${error.message}`));
+        }
     }
 }
 
@@ -323,6 +500,8 @@ async function runBot() {
     try {
         console.log(chalk.cyan.bold('═══════════════════════════════════════'));
         console.log(chalk.cyan.bold('   Walme Auto Bot - Airdrop Insiders   '));
+        console.log(chalk.cyan.bold('═══════════════════════════════════════'));
+        console.log(chalk.cyan.bold(`   ${new Date().toLocaleString()}   `));
         console.log(chalk.cyan.bold('═══════════════════════════════════════'));
 
         console.log(chalk.white('🔑 [INFO] Fetching access tokens...'));
@@ -332,7 +511,13 @@ async function runBot() {
         console.log(chalk.white('🌐 [INFO] Loading proxies...'));
         const proxies = await getProxies();
         
-        let completedTasks = await loadCompletedTasks();
+        // Track failed proxy counters
+        const proxyFailures = {};
+        if (proxies.length > 0) {
+            proxies.forEach(proxy => {
+                proxyFailures[proxy] = 0;
+            });
+        }
 
         while (true) {
             console.log(chalk.cyan('─'.repeat(40)));
@@ -340,29 +525,76 @@ async function runBot() {
             for (let i = 0; i < tokens.length; i++) {
                 const token = tokens[i];
                 
-                let proxyAgent = null;
+                // Select proxy for this account with failure tracking
+                let proxyString = null;
                 if (proxies.length > 0) {
-                    const proxyIndex = i % proxies.length;
-                    const proxyString = proxies[proxyIndex];
-                    console.log(chalk.white(`🌐 [INFO] Using proxy: ${proxyString.replace(/:[^:]*@/, ':****@')}`));
-                    proxyAgent = createProxyAgent(proxyString);
+                    // Find proxies with fewer failures
+                    const healthyProxies = proxies.filter(p => proxyFailures[p] < 3);
                     
-                    if (!proxyAgent) {
-                        console.log(chalk.yellow(`[WARNING] Failed to create proxy agent for: ${proxyString}. Continuing without proxy.`));
+                    if (healthyProxies.length > 0) {
+                        const proxyIndex = i % healthyProxies.length;
+                        proxyString = healthyProxies[proxyIndex];
+                    } else {
+                        // Reset failure counters if all proxies have issues
+                        console.log(chalk.yellow('⚠️ [WARNING] All proxies have high failure counts. Resetting counters.'));
+                        proxies.forEach(proxy => {
+                            proxyFailures[proxy] = 0;
+                        });
+                        const proxyIndex = i % proxies.length;
+                        proxyString = proxies[proxyIndex];
                     }
                 }
                 
-                completedTasks = await processAccount(token, completedTasks, proxyAgent);
-                await new Promise(resolve => setTimeout(resolve, 2000)); 
+                // Process account with retry mechanism
+                try {
+                    await processAccount(token, proxyString);
+                } catch (accError) {
+                    // If proxy error, increment failure counter
+                    if (proxyString && isProxyError(accError)) {
+                        proxyFailures[proxyString] = (proxyFailures[proxyString] || 0) + 1;
+                        console.log(chalk.yellow(`⚠️ [WARNING] Proxy ${proxyString.replace(/:[^:]*@/, ':****@')} failed ${proxyFailures[proxyString]} times`));
+                    }
+                }
+                
+                // Random delay between accounts to avoid pattern detection
+                const accountDelay = 2000 + Math.random() * 3000;
+                await new Promise(resolve => setTimeout(resolve, accountDelay)); 
+            }
+            
+            // Log healthy and problematic proxies
+            if (proxies.length > 0) {
+                const problematicProxies = proxies.filter(p => proxyFailures[p] >= 2);
+                if (problematicProxies.length > 0) {
+                    console.log(chalk.yellow('⚠️ [WARNING] Problematic proxies:'));
+                    problematicProxies.forEach(p => {
+                        console.log(chalk.yellow(`  - ${p.replace(/:[^:]*@/, ':****@')}: ${proxyFailures[p]} failures`));
+                    });
+                }
             }
 
-            await saveCompletedTasks(completedTasks);
-
-            const nextRunTime = startCountdown();
+            // Shorter interval for testing - adjust as needed
+            const runInterval = 3; // hours
+            const nextRunTime = startCountdown(runInterval);
             await new Promise(resolve => setTimeout(resolve, nextRunTime - new Date()));
             console.log('');
         }
     } catch (error) {
         console.error(chalk.red.bold(`💥 [ERROR] Bot execution failed: ${error.message}`));
+        console.log(chalk.yellow('🔄 [INFO] Restarting bot in 1 minute...'));
+        // Restart the bot after 1 minute
+        setTimeout(() => runBot(), 60 * 1000);
+    }
+}
+
+// Remove the auto-start at the bottom since we're starting from the initialization
+async function startBot() {
+    try {
+        // Catch-all wrapper to ensure the bot restarts if it crashes
+        await runBot();
+    } catch (error) {
+        console.error(chalk.red.bold(`💥 [CRITICAL ERROR] Bot crashed: ${error.message}`));
+        console.log(chalk.yellow('🔄 [INFO] Restarting bot in 1 minute...'));
+        // Restart the bot after 1 minute
+        setTimeout(() => startBot(), 60 * 1000);
     }
 }
