@@ -192,13 +192,14 @@ function createRequestConfig(token, proxyAgent) {
 }
 
 // Retry function for API requests using the same proxy
-async function retryApiRequest(requestFn, args, proxyString, maxRetries = MAX_RETRIES) {
+async function retryApiRequest(requestFn, args, proxyString, maxRetries = MAX_RETRIES, logProxy = false) {
     let proxyAgent = null;
     if (proxyString) {
         proxyAgent = createProxyAgent(proxyString);
         if (!proxyAgent) {
             console.log(chalk.yellow(`[WARNING] Failed to create proxy agent for: ${proxyString}. Continuing without proxy.`));
-        } else {
+        } else if (logProxy) {
+            // Only log if explicitly requested
             console.log(chalk.white(`🌐 [INFO] Using proxy: ${proxyString.replace(/:[^:]*@/, ':****@')}`));
         }
     }
@@ -241,7 +242,9 @@ async function retryApiRequest(requestFn, args, proxyString, maxRetries = MAX_RE
                 // For proxy errors, recreate the proxy agent (helps with some connection issues)
                 if (isProxy && proxyString) {
                     proxyAgent = createProxyAgent(proxyString);
-                    console.log(chalk.white(`🌐 [INFO] Recreated proxy agent for retry`));
+                    if (logProxy) {
+                        console.log(chalk.white(`🌐 [INFO] Recreated proxy agent for retry`));
+                    }
                 }
             } else {
                 // Last attempt failed
@@ -255,6 +258,7 @@ async function retryApiRequest(requestFn, args, proxyString, maxRetries = MAX_RE
         }
     }
 }
+
 
 async function getUserProfile(token, proxyAgent) {
     try {
@@ -361,11 +365,11 @@ async function processDailyChallenge(token, tasks, proxyAgent) {
         // Process the daily challenge
         console.log(chalk.yellow(`🌟 [INFO] Processing daily challenge...`));
         
-        const config = createRequestConfig(token, proxyAgent);
-        const response = await axios.patch(`${BASE_URL}/${dailyChallengeId}`, {}, config);
+        // Use the completeTask function that has better error handling
+        const result = await completeTask(dailyChallengeId, token, proxyAgent);
         
-        if (response.data && response.data.iterator) {
-            const { day, reward } = response.data.iterator;
+        if (result && result.iterator) {
+            const { day, reward } = result.iterator;
             console.log(chalk.green(`✅ [SUCCESS] Daily challenge Day ${day} completed! Earned ${reward} XP`));
             
             if (day === 7) {
@@ -378,7 +382,8 @@ async function processDailyChallenge(token, tasks, proxyAgent) {
         return true;
     } catch (error) {
         console.error(chalk.red(`❌ [ERROR] Failed to process daily challenge: ${error.message}`));
-        return false;
+        // Re-throw the error so it can be caught and retried
+        throw error;
     }
 }
 
@@ -387,15 +392,16 @@ async function processAccount(token, proxyString) {
     let proxyAgent = null;
     
     try {
-        // Create proxy agent if proxy string provided
+        // Log proxy info once at the account level
         if (proxyString) {
+            console.log(chalk.white(`🌐 [INFO] Account using proxy: ${proxyString.replace(/:[^:]*@/, ':****@')}`));
             proxyAgent = createProxyAgent(proxyString);
         }
         
-        // Get user profile
+        // Get user profile with retry - log proxy on first call only
         console.log(chalk.white('👤 [INFO] Fetching user profile...'));
         try {
-            profile = await retryApiRequest(getUserProfile, [token], proxyString);
+            profile = await retryApiRequest(getUserProfile, [token], proxyString, MAX_RETRIES, true);
         } catch (profileError) {
             console.error(chalk.red.bold(`[ERROR] Failed to fetch profile: ${profileError.message}`));
             return; // Exit early if profile fetch fails
@@ -404,29 +410,30 @@ async function processAccount(token, proxyString) {
         // Make sure we have a nickname for display
         const nickname = profile?.nickname || 'unknown_user';
         
-        // Fetch task list
+        // Fetch task list with retry - don't log proxy again
         console.log(chalk.white(`📋 [INFO] ${nickname} - Fetching task list...`));
         let tasks = [];
         try {
-            tasks = await retryApiRequest(getTasks, [token], proxyString);
+            tasks = await retryApiRequest(getTasks, [token], proxyString, MAX_RETRIES, false);
             console.log(chalk.white(`📋 [INFO] ${nickname} - Task list fetched, total tasks: ${tasks.length}`));
         } catch (tasksError) {
             console.error(chalk.red.bold(`[ERROR] ${nickname} - Failed to fetch tasks: ${tasksError.message}`));
             return; // Exit early if task fetch fails
         }
 
-        // First, handle the daily challenge task
+        // Handle the daily challenge task with retry - don't log proxy
         let dailyChallengeSuccess = false;
         try {
-            dailyChallengeSuccess = await processDailyChallenge(token, tasks, proxyAgent);
+            dailyChallengeSuccess = await retryApiRequest(processDailyChallenge, [token, tasks], proxyString, MAX_RETRIES, false);
         } catch (dcError) {
             console.error(chalk.red(`❌ [ERROR] ${nickname} - Error in daily challenge: ${dcError.message}`));
         }
 
+        // Filter tasks as before...
         const pendingTasks = tasks.filter(task => {
             // Check if this is a daily challenge task
             const isDailyChallenge = (task.title && task.title.includes('7-DAY Challenge')) || 
-                                     (task.group === 'daily' && task.iterable === true && task.type === 'dummy');
+                                    (task.group === 'daily' && task.iterable === true && task.type === 'dummy');
             
             // Only include non-daily-challenge tasks that need to be processed
             return (task.status === 'new' || task.status === 'failed') && !isDailyChallenge;
@@ -445,11 +452,8 @@ async function processAccount(token, proxyString) {
                     for (const childTask of task.child) {
                         if (childTask.status === 'new' || childTask.status === 'failed') {
                             try {
-                                // Create config for this request
-                                const config = createRequestConfig(token, proxyAgent);
-                                
-                                // Complete the task directly
-                                await axios.patch(`${BASE_URL}/${childTask.id}`, {}, config);
+                                // Use retryApiRequest without proxy logging
+                                await retryApiRequest(completeTask, [childTask.id, token], proxyString, MAX_RETRIES, false);
                                 
                                 completedTaskCount++;
                                 console.log(chalk.green(`✅ [SUCCESS] ${nickname} - Completed child task: ${childTask.title} (ID: ${childTask.id})`));
@@ -464,11 +468,8 @@ async function processAccount(token, proxyString) {
                         }
                     }
                 } else {
-                    // Create config for this request
-                    const config = createRequestConfig(token, proxyAgent);
-                    
-                    // Complete the task directly
-                    await axios.patch(`${BASE_URL}/${task.id}`, {}, config);
+                    // Use retryApiRequest without proxy logging
+                    await retryApiRequest(completeTask, [task.id, token], proxyString, MAX_RETRIES, false);
                     
                     completedTaskCount++;
                     console.log(chalk.green(`✅ [SUCCESS] ${nickname} - Completed task: ${task.title} (ID: ${task.id})`));
@@ -483,6 +484,7 @@ async function processAccount(token, proxyString) {
             }
         }
 
+        // Rest of the function remains the same...
         console.log(chalk.green.bold(`🎉 [SUCCESS] ${nickname} - Processed ${completedTaskCount} tasks successfully, ${failedTaskCount} tasks failed`));
         
         // Daily challenge status
