@@ -22,9 +22,6 @@ const MAX_RETRIES = 3;
 const RETRY_DELAY = 3000; // 3 seconds
 const REQUEST_TIMEOUT = 15000; // 15 seconds
 
-// Constants for special tasks
-const DAILY_CHALLENGE_TASK_ID = 17280603; // ID of the 7-DAY Challenge task
-
 // List of common proxy error codes
 const PROXY_ERROR_CODES = [
     'ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EHOSTUNREACH',
@@ -340,13 +337,19 @@ function startCountdown(duration = 24) {
 // Function to handle the daily challenge task specifically
 async function processDailyChallenge(token, tasks, proxyAgent) {
     try {
-        // Find the daily challenge task
-        const dailyTask = tasks.find(task => task.id === DAILY_CHALLENGE_TASK_ID);
+        // Find the daily challenge task by title, type, and group instead of ID
+        const dailyTask = tasks.find(task => 
+            (task.title && task.title.includes('7-DAY Challenge')) || 
+            (task.group === 'daily' && task.iterable === true && task.type === 'dummy')
+        );
         
         if (!dailyTask) {
             console.log(chalk.yellow(`⚠️ [INFO] Daily challenge task not found`));
             return false;
         }
+        
+        const dailyChallengeId = dailyTask.id;
+        console.log(chalk.yellow(`🌟 [INFO] Found daily challenge with ID: ${dailyChallengeId}`));
         
         // Check if the task is already completed for today (status will be completed or started)
         if (dailyTask.status === 'completed' || dailyTask.status === 'started') {
@@ -359,7 +362,7 @@ async function processDailyChallenge(token, tasks, proxyAgent) {
         console.log(chalk.yellow(`🌟 [INFO] Processing daily challenge...`));
         
         const config = createRequestConfig(token, proxyAgent);
-        const response = await axios.patch(`${BASE_URL}/${DAILY_CHALLENGE_TASK_ID}`, {}, config);
+        const response = await axios.patch(`${BASE_URL}/${dailyChallengeId}`, {}, config);
         
         if (response.data && response.data.iterator) {
             const { day, reward } = response.data.iterator;
@@ -420,12 +423,14 @@ async function processAccount(token, proxyString) {
             console.error(chalk.red(`❌ [ERROR] ${nickname} - Error in daily challenge: ${dcError.message}`));
         }
 
-        // Filter tasks to only process those that need to be completed
-        // Skip the daily challenge task as we've already handled it
-        const pendingTasks = tasks.filter(task => 
-            (task.status === 'new' || task.status === 'failed') && 
-            task.id !== DAILY_CHALLENGE_TASK_ID
-        );
+        const pendingTasks = tasks.filter(task => {
+            // Check if this is a daily challenge task
+            const isDailyChallenge = (task.title && task.title.includes('7-DAY Challenge')) || 
+                                     (task.group === 'daily' && task.iterable === true && task.type === 'dummy');
+            
+            // Only include non-daily-challenge tasks that need to be processed
+            return (task.status === 'new' || task.status === 'failed') && !isDailyChallenge;
+        });
         console.log(chalk.white(`📋 [INFO] ${nickname} - Pending tasks: ${pendingTasks.length}`));
 
         // Initialize task counter
@@ -573,7 +578,7 @@ async function runBot() {
             }
 
             // Shorter interval for testing - adjust as needed
-            const runInterval = 25; // hours
+            const runInterval = 3; // hours
             const nextRunTime = startCountdown(runInterval);
             await new Promise(resolve => setTimeout(resolve, nextRunTime - new Date()));
             console.log('');
